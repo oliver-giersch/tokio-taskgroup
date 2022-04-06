@@ -24,6 +24,10 @@ impl<E> JoinHandleStream<E> {
         }
     }
 
+    pub(crate) fn close(&mut self) {
+        self.closed = true;
+    }
+
     pub(crate) fn insert(&mut self, name: TaskName, handle: task::JoinHandle<Result<(), E>>) {
         debug_assert!(!self.closed);
         self.handles.push((name, handle));
