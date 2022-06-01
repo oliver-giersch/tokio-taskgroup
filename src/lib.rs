@@ -62,7 +62,7 @@ impl<E: Send + 'static> TaskGroup<E> {
         JoinGroupHandle { done_rx }
     }
 
-    pub fn spawn<F>(&self, name: impl Into<TaskName>, future: F)
+    pub fn spawn<F>(&self, name: impl Into<TaskName>, future: F) -> Result<(), SpawnError>
     where
         F: Future<Output = Result<(), E>> + Send + 'static,
     {
@@ -70,8 +70,7 @@ impl<E: Send + 'static> TaskGroup<E> {
         let handle = task::spawn(future);
         let event = Event::Handle(name.into(), handle);
 
-        let res = self.tx.send(event);
-        assert!(res.is_ok(), "spawning must always succeed");
+        self.tx.send(event).map_err(|_| SpawnError)
     }
 
     /// ...
@@ -82,12 +81,16 @@ impl<E: Send + 'static> TaskGroup<E> {
     pub async fn errored(&mut self) -> (TaskName, TaskError<E>) {
         let done_rx = self
             .done_rx
-            .take()
+            .as_mut()
             .expect("task group error has already been observed");
+        tokio::pin!(done_rx);
 
         match done_rx.await {
             Ok(Ok(_)) | Err(_) => unreachable!("TODO: EXPLAIN"),
-            Ok(Err((name, err))) => (name, err),
+            Ok(Err((name, err))) => {
+                self.done_rx = None;
+                (name, err)
+            }
         }
     }
 
@@ -167,8 +170,6 @@ async fn group_manager<E>(
     // todo: cancel all handles still in rx
 }
 
-fn convert_task_result() {}
-
 #[cfg(test)]
 fn block_on<F: Future<Output = ()> + Send>(f: F) {
     tokio::runtime::Builder::new_current_thread()
@@ -182,22 +183,32 @@ fn block_on<F: Future<Output = ()> + Send>(f: F) {
 mod tests {
     use std::{
         sync::{
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicI32, Ordering},
             Arc,
         },
         time::Duration,
     };
 
+    use crate::stream::TaskError;
+
     use super::TaskGroup;
+
+    struct OnCancel(Arc<AtomicI32>);
+
+    impl Drop for OnCancel {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 
     #[test]
     fn close() {
         crate::block_on(async {
             let group = TaskGroup::<()>::new();
 
-            group.spawn("a", async { Ok(()) });
-            group.spawn("b", async { Ok(()) });
-            group.spawn("c", async { Ok(()) });
+            group.spawn("a", async { Ok(()) }).unwrap();
+            group.spawn("b", async { Ok(()) }).unwrap();
+            group.spawn("c", async { Ok(()) }).unwrap();
 
             let handle = group.close();
             let res = handle.join().await;
@@ -207,29 +218,64 @@ mod tests {
 
     #[test]
     fn cancel() {
-        struct OnCancel(Arc<AtomicBool>);
-
-        impl Drop for OnCancel {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::Relaxed);
-            }
-        }
-
         crate::block_on(async {
-            let cancelled = Arc::default();
-
             let group = TaskGroup::<()>::new();
 
+            let cancelled = Arc::default();
             let flag = Arc::clone(&cancelled);
-            group.spawn("a", async move {
-                let _guard = OnCancel(flag);
-                std::future::pending().await
-            });
+            group
+                .spawn("a", async move {
+                    let _guard = OnCancel(flag);
+                    std::future::pending().await
+                })
+                .unwrap();
 
+            // yielding before & after allows the runtime
+            // to schedule the other tasks
+            tokio::task::yield_now().await;
             drop(group);
             tokio::task::yield_now().await;
 
-            assert!(cancelled.load(Ordering::Relaxed));
+            assert_eq!(cancelled.load(Ordering::Relaxed), 1);
+        })
+    }
+
+    #[test]
+    fn keep_spawning() {
+        crate::block_on(async {
+            let mut group = TaskGroup::<i32>::new();
+            let mut timer = tokio::time::interval(Duration::from_millis(1));
+
+            let mut i = 0;
+            let counter = Arc::new(AtomicI32::new(0));
+
+            let (name, code) = loop {
+                tokio::select! {
+                    err = group.errored() => break err,
+                    _ = timer.tick() => {
+                        let counter = Arc::clone(&counter);
+                        if i < 10 {
+                            group.spawn(format!("t-{i}"), async move {
+                                let _guard = OnCancel(counter);
+                                std::future::pending().await
+                            }).unwrap();
+                        } else if i == 10 {
+                            group.spawn(format!("t-{i}"), async {
+                                Err(-1)
+                            }).unwrap();
+                        }
+
+                        i += 1;
+                    }
+                }
+            };
+
+            assert_eq!(name, "t-10");
+            assert_eq!(code, TaskError::Error(-1));
+
+            tokio::task::yield_now().await;
+
+            assert_eq!(counter.load(Ordering::Relaxed), 10);
         })
     }
 }
