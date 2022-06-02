@@ -22,7 +22,7 @@ impl<E: cmp::PartialEq> cmp::PartialEq for TaskError<E> {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Error(e0), Self::Error(e1)) => e0.eq(e1),
-            (Self::Panic, Self::Panic) => true,
+            (Self::Panic, Self::Panic) => false, // two panics are never equal
             _ => false,
         }
     }
@@ -37,18 +37,16 @@ impl<E: fmt::Display> fmt::Display for TaskError<E> {
 }
 
 /// A stream of task join handles which produces an item whenever a task handle
-/// completes.
+/// is joined.
 pub(crate) struct JoinHandleStream<E = ()> {
     handles: Vec<(TaskName, task::JoinHandle<Result<(), E>>)>,
     closed: bool,
 }
 
 impl<E> JoinHandleStream<E> {
+    /// Returns a new stream with an initial `capacity`.
     pub(crate) fn with_capacity(capacity: usize) -> Self {
-        Self {
-            handles: Vec::with_capacity(capacity),
-            closed: false,
-        }
+        Self { handles: Vec::with_capacity(capacity), closed: false }
     }
 
     pub(crate) fn close(&mut self) {
@@ -56,10 +54,12 @@ impl<E> JoinHandleStream<E> {
     }
 
     pub(crate) fn insert(&mut self, name: TaskName, handle: task::JoinHandle<Result<(), E>>) {
-        debug_assert!(!self.closed, "can not insert into closed stream");
+        assert!(!self.closed, "can not insert into closed stream");
         self.handles.push((name, handle));
     }
 
+    /// Closes the stream, aborts all currently present tasks and waits for the
+    /// cancellation to complete.
     pub(crate) async fn abort_all(&mut self) {
         self.closed = true;
         for (_, handle) in &self.handles {
@@ -70,11 +70,11 @@ impl<E> JoinHandleStream<E> {
     }
 
     fn poll_next_join(&mut self, cx: &mut Context<'_>) -> Poll<Option<TaskJoinResult<E>>> {
+        // poll all handles
         for i in 0..self.handles.len() {
             let (_, handle) = &mut self.handles[i];
             if let Poll::Ready(res) = Pin::new(handle).poll(cx) {
                 let (name, _) = self.handles.swap_remove(i);
-                self.shrink_if_oversized();
 
                 let res = match res {
                     Ok(Ok(_)) => Ok(()),
@@ -93,6 +93,7 @@ impl<E> JoinHandleStream<E> {
             return Poll::Ready(None);
         }
 
+        self.shrink_if_oversized();
         Poll::Pending
     }
 

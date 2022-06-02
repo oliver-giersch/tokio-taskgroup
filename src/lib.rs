@@ -1,29 +1,35 @@
 mod stream;
 
-use std::{borrow::Cow, future::Future};
+use std::{borrow::Cow, fmt, future::Future};
 
-use stream::TaskError;
 use tokio::{
     sync::{mpsc, oneshot},
     task,
 };
 use tokio_stream::StreamExt;
 
-use crate::stream::JoinHandleStream;
+use crate::stream::{JoinHandleStream, TaskError};
 
+/// The name of a task spawned inside a group.
 type TaskName = Cow<'static, str>;
+/// The result of an entire [`TaskGroup`].
+type GroupResult<E> = Result<(), (TaskName, TaskError<E>)>;
 
 // TODO: handle sender
 // TODO: error receiver (mut)
 pub struct TaskGroup<E> {
+    /// The channel for spawning further tasks.
     tx: mpsc::UnboundedSender<Event<E>>,
+    /// The receiver for the group's completion.
     done_rx: Option<oneshot::Receiver<GroupResult<E>>>,
 }
 
 impl<E: Send + 'static> TaskGroup<E> {
+    /// Returns a new [`TaskGroup`].
+    ///
     /// # Panics
     ///
-    /// Panics, if this is called outside of a tokio runtime.
+    /// Panics, if called outside of a tokio runtime.
     pub fn new() -> Self {
         Self::with_capacity(0, false)
     }
@@ -42,35 +48,44 @@ impl<E: Send + 'static> TaskGroup<E> {
             let _ = task::spawn(group_manager(capacity, done_tx, rx));
         }
 
-        Self {
-            tx,
-            done_rx: Some(done_rx),
-        }
+        Self { tx, done_rx: Some(done_rx) }
     }
 
-    /// Closes the [`TaskGroup`]
+    /// Closes the [`TaskGroup`] to further task additions and returns a
+    /// [`JoinGroupHandle`] for awaiting the group's completion.
     pub fn close(mut self) -> JoinGroupHandle<E> {
-        let done_rx = self
-            .done_rx
-            .take()
-            .expect("task group error has already been observed");
+        let done_rx = self.done_rx.take().expect("task group error has already been observed");
 
         // send the close message to group manager
         let res = self.tx.send(Event::Closed);
         assert!(res.is_ok(), "group manager must be available for close msg");
 
-        JoinGroupHandle { done_rx }
+        JoinGroupHandle { done_rx, _tx: self.tx }
     }
 
+    /// Spawns a task for the given `future` and adds it to the task group.
+    ///
+    /// # Errors
+    ///
+    /// Fails, if the task group has previously encountered an error. In this
+    /// case the spawned task will be cancelled.
+    /// Once a `spawn` has failed, all subsequent ones will fail as well.
+    /// The encountered error can be retrieved by calling
+    /// [`errored`](TaskGroup::errored).
     pub fn spawn<F>(&self, name: impl Into<TaskName>, future: F) -> Result<(), SpawnError>
     where
         F: Future<Output = Result<(), E>> + Send + 'static,
     {
-        // spawn
+        // spawn the task and send its handle to the manager
         let handle = task::spawn(future);
         let event = Event::Handle(name.into(), handle);
-
-        self.tx.send(event).map_err(|_| SpawnError)
+        self.tx.send(event).map_err(|err| match err.0 {
+            Event::Handle(name, handle) => {
+                handle.abort();
+                SpawnError(name)
+            }
+            Event::Closed => unreachable!(),
+        })
     }
 
     /// ...
@@ -79,26 +94,22 @@ impl<E: Send + 'static> TaskGroup<E> {
     ///
     /// ...
     pub async fn errored(&mut self) -> (TaskName, TaskError<E>) {
-        let done_rx = self
-            .done_rx
-            .as_mut()
-            .expect("task group error has already been observed");
+        let done_rx = self.done_rx.as_mut().expect("task group error has already been observed");
         tokio::pin!(done_rx);
 
         match done_rx.await {
-            Ok(Ok(_)) | Err(_) => unreachable!("TODO: EXPLAIN"),
+            Ok(Ok(_)) | Err(_) => unreachable!("not possible while group exists"),
             Ok(Err((name, err))) => {
                 self.done_rx = None;
                 (name, err)
             }
         }
     }
-
-    // TODO: can fail, even if not close
 }
 
 pub struct JoinGroupHandle<E> {
     done_rx: oneshot::Receiver<GroupResult<E>>,
+    _tx: mpsc::UnboundedSender<Event<E>>,
 }
 
 impl<E> JoinGroupHandle<E> {
@@ -108,14 +119,18 @@ impl<E> JoinGroupHandle<E> {
 }
 
 #[derive(Debug)]
-pub struct SpawnError;
+pub struct SpawnError(TaskName);
+
+impl fmt::Display for SpawnError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "failed to spawn task '{}'", self.0)
+    }
+}
 
 enum Event<E> {
     Handle(TaskName, task::JoinHandle<Result<(), E>>),
     Closed,
 }
-
-type GroupResult<E> = Result<(), (TaskName, TaskError<E>)>;
 
 async fn group_manager<E>(
     capacity: usize,
@@ -132,32 +147,35 @@ async fn group_manager<E>(
 
         tokio::select! {
             biased;
-            // a task has completed or there are no more tasks
+            // 1) task has completed or group is closed & there are no more tasks
             res = &mut next => match res {
                 // the completed task had an error
-                Some(res) => if let Err(e) = res {
-                    // close the channel to prevent spawning further tasks, but
-                    // keep handling any that have already been queued, i.e.,
-                    // don't break yet
-                    rx.close();
-                    group_res = Err(e);
+                Some(res) => {
+                    if let Err(e) = res {
+                        // close the channel to prevent spawning further tasks,
+                        // but keep handling any that have already been queued,
+                        // i.e., don't break out yet
+                        rx.close();
+                        group_res = Err(e);
+                    }
                 },
                 // the task group has been closed and all tasks have finished
+                // NOTE: this can only happen AFTER `stream` has been closed
                 None => break,
             },
             msg = rx.recv() => match msg {
                 Some(Event::Handle(name, handle)) => {
-                    assert!(is_closed == false);
+                    assert!(is_closed == false, "close event already received");
                     stream.insert(name, handle)
                 },
                 Some(Event::Closed) => {
+                    // closing the stream will end it once all currently stored
+                    // task handles have been joined
                     is_closed = true;
-                    rx.close();
                     stream.close();
                 },
                 None => {
-                    // if the group handle is just dropped (without sending a
-                    // close message), cancel all tasks
+                    // if the group or join handle is dropped, cancel all tasks
                     stream.abort_all().await;
                     break;
                 },
@@ -165,18 +183,13 @@ async fn group_manager<E>(
         }
     }
 
+    // send the result to the callsite
     let _ = done_tx.send(group_res);
-
-    // todo: cancel all handles still in rx
 }
 
 #[cfg(test)]
 fn block_on<F: Future<Output = ()> + Send>(f: F) {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .build()
-        .unwrap()
-        .block_on(f)
+    tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap().block_on(f)
 }
 
 #[cfg(test)]
@@ -277,5 +290,33 @@ mod tests {
 
             assert_eq!(counter.load(Ordering::Relaxed), 10);
         })
+    }
+
+    #[test]
+    fn keep_running() {
+        crate::block_on(async {
+            let group = TaskGroup::<i32>::new();
+            let counter = Arc::new(AtomicI32::new(0));
+
+            {
+                let counter = Arc::clone(&counter);
+                group
+                    .spawn("a", async move {
+                        let _guard = OnCancel(counter);
+                        std::future::pending().await
+                    })
+                    .unwrap();
+            }
+
+            // close the group, this must not cancel the task
+            let handle = group.close();
+            tokio::task::yield_now().await;
+            assert_eq!(counter.load(Ordering::Relaxed), 0);
+
+            // drop the join handle, this MUST cancel the task
+            drop(handle);
+            tokio::task::yield_now().await;
+            assert_eq!(counter.load(Ordering::Relaxed), 1);
+        });
     }
 }
