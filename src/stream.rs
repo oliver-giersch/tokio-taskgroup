@@ -1,8 +1,4 @@
 use std::{
-    any::Any,
-    cmp,
-    error::{self, Error},
-    fmt,
     future::Future,
     pin::Pin,
     task::{Context, Poll},
@@ -11,79 +7,11 @@ use std::{
 use tokio::task;
 use tokio_stream::{Stream, StreamExt};
 
-use crate::TaskName;
+use crate::{PanicPayload, TaskError, TaskName};
 
 // if `Ok` the task finished successfully or was cancelled by the group manager,
 // if `Err`, the task identified by its name encountered an error.
 type TaskJoinResult<E> = Result<(), TaskError<E>>;
-
-/// The error from a task joined after an error or due to panic.
-#[derive(Debug)]
-pub enum TaskError<E> {
-    /// The joined task panicked
-    Panic(TaskName, PanicPayload),
-    /// The joined task returned an error.
-    Error(TaskName, E),
-}
-
-impl<E> TaskError<E> {
-    /// Returns the name of the task which encountered the error.
-    pub fn task_name(&self) -> &str {
-        match self {
-            Self::Panic(name, _) => name.as_ref(),
-            Self::Error(name, _) => name.as_ref(),
-        }
-    }
-
-    fn error(name: TaskName, err: E) -> Self {
-        Self::Error(name, err)
-    }
-}
-
-impl<E: cmp::PartialEq> cmp::PartialEq for TaskError<E> {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Error(n0, e0), Self::Error(n1, e1)) => n0.eq(n1) && e0.eq(e1),
-            (Self::Panic(_, p0), Self::Panic(_, p1)) => std::ptr::eq(p0, p1),
-            _ => false,
-        }
-    }
-}
-
-impl<E: cmp::Eq> cmp::Eq for TaskError<E> {}
-
-impl<E: fmt::Display> fmt::Display for TaskError<E> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Panic(name, _) => write!(f, "task '{name}' panicked"),
-            Self::Error(name, _) => write!(f, "task '{name}' had an error"),
-        }
-    }
-}
-
-impl<E: error::Error + 'static> error::Error for TaskError<E> {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            TaskError::Panic(_, _) => None,
-            TaskError::Error(_, err) => Some(err),
-        }
-    }
-}
-
-/// The payload of a task's panic.
-#[derive(Debug)]
-pub struct PanicPayload(Box<dyn Any + Send + 'static>);
-
-impl PanicPayload {
-    /// Returns the inner panic payload, which can be passed, e.g., to
-    /// [`resume_unwind`](std::panic::resume_unwind).
-    pub fn into_inner(self) -> Box<dyn Any + Send + 'static> {
-        self.0
-    }
-}
-
-// SAFETY: cf `tokio::util::SyncWrapper`
-unsafe impl Sync for PanicPayload {}
 
 /// A stream of task join handles which produces an item whenever a task handle
 /// is joined.
@@ -171,7 +99,6 @@ impl<E> Stream for JoinHandleStream<E> {
 
 #[cfg(test)]
 mod tests {
-
     use tokio::task;
     use tokio_stream::StreamExt;
 
