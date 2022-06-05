@@ -1,3 +1,8 @@
+//! # `tokio-taskgroup`
+//!
+//! This crate provides the [`TaskGroup`] type, which allows spawning related
+//! tasks in a group with unified error handling.
+
 mod stream;
 
 use std::{
