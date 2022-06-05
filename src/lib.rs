@@ -1,6 +1,6 @@
 mod stream;
 
-use std::{borrow::Cow, fmt, future::Future};
+use std::{borrow::Cow, error, fmt, future::Future};
 
 use tokio::{
     sync::{mpsc, oneshot},
@@ -13,10 +13,13 @@ use crate::stream::{JoinHandleStream, TaskError};
 /// The name of a task spawned inside a group.
 type TaskName = Cow<'static, str>;
 /// The result of an entire [`TaskGroup`].
-type GroupResult<E> = Result<(), (TaskName, TaskError<E>)>;
+type GroupResult<E> = Result<(), TaskError<E>>;
 
-// TODO: handle sender
-// TODO: error receiver (mut)
+/// A handle to a group of [`tokio::task`]s which runs until all tasks have
+/// finished or until one task encounters an error.
+///
+/// Tasks spawned into a [`TaskGroup`] must return a `Result<(), E>`, if tasks
+/// should return values on success as well, channels should be used.
 pub struct TaskGroup<E> {
     /// The channel for spawning further tasks.
     tx: mpsc::UnboundedSender<Event<E>>,
@@ -34,10 +37,16 @@ impl<E: Send + 'static> TaskGroup<E> {
         Self::with_capacity(0, false)
     }
 
+    /// Returns a new local [`TaskGroup`], i.e., with a local manager task.
+    ///
+    /// # Panics
+    ///
+    /// Panics, if called outside of a tokio runtime.
     pub fn local() -> Self {
         Self::with_capacity(0, true)
     }
 
+    /// Returns a new [`TaskGroup`] with an initial task handle `capacity`.
     pub fn with_capacity(capacity: usize, local: bool) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let (done_tx, done_rx) = oneshot::channel();
@@ -76,10 +85,14 @@ impl<E: Send + 'static> TaskGroup<E> {
     where
         F: Future<Output = Result<(), E>> + Send + 'static,
     {
+        // can not spawn further tasks once an reported error has been observed.
+        if self.done_rx.is_none() {
+            return Err(SpawnError(name.into()));
+        }
+
         // spawn the task and send its handle to the manager
         let handle = task::spawn(future);
-        let event = Event::Handle(name.into(), handle);
-        self.tx.send(event).map_err(|err| match err.0 {
+        self.tx.send(Event::Handle(name.into(), handle)).map_err(|err| match err.0 {
             Event::Handle(name, handle) => {
                 handle.abort();
                 SpawnError(name)
@@ -88,44 +101,62 @@ impl<E: Send + 'static> TaskGroup<E> {
         })
     }
 
+    /// Resolves when a task in the group has reported an error.
+    ///
+    /// # Cancel Safety
+    ///
     /// ...
     ///
     /// # Panics
     ///
-    /// ...
-    pub async fn errored(&mut self) -> (TaskName, TaskError<E>) {
+    /// Panics, if called again after observing an error.
+    pub async fn errored(&mut self) -> TaskError<E> {
         let done_rx = self.done_rx.as_mut().expect("task group error has already been observed");
         tokio::pin!(done_rx);
 
         match done_rx.await {
-            Ok(Ok(_)) | Err(_) => unreachable!("not possible while group exists"),
-            Ok(Err((name, err))) => {
+            Ok(Ok(_)) | Err(_) => unreachable!("not possible while handle exists"),
+            Ok(Err(err)) => {
                 self.done_rx = None;
-                (name, err)
+                err
             }
         }
     }
 }
 
+/// A handle for joining a closed [`TaskGroup`].
+///
+/// If the handle is dropped, all tasks are cancelled.
 pub struct JoinGroupHandle<E> {
     done_rx: oneshot::Receiver<GroupResult<E>>,
     _tx: mpsc::UnboundedSender<Event<E>>,
 }
 
 impl<E> JoinGroupHandle<E> {
-    pub async fn join(self) -> Result<(), (TaskName, TaskError<E>)> {
-        self.done_rx.await.expect("TODO")
+    /// Joins all remaining tasks in the [`TaskGroup`].
+    pub async fn join(self) -> Result<(), TaskError<E>> {
+        self.done_rx.await.expect("not possible while handle exists")
     }
 }
 
+/// The error returned when spawning into a [`TaskGroup`] fails.
 #[derive(Debug)]
 pub struct SpawnError(TaskName);
+
+impl SpawnError {
+    /// Returns the name of the task that failed to be spawned.
+    pub fn name(&self) -> &str {
+        self.0.as_ref()
+    }
+}
 
 impl fmt::Display for SpawnError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "failed to spawn task '{}'", self.0)
     }
 }
+
+impl error::Error for SpawnError {}
 
 enum Event<E> {
     Handle(TaskName, task::JoinHandle<Result<(), E>>),
@@ -262,7 +293,7 @@ mod tests {
             let mut i = 0;
             let counter = Arc::new(AtomicI32::new(0));
 
-            let (name, code) = loop {
+            let err = loop {
                 tokio::select! {
                     err = group.errored() => break err,
                     _ = timer.tick() => {
@@ -283,8 +314,8 @@ mod tests {
                 }
             };
 
-            assert_eq!(name, "t-10");
-            assert_eq!(code, TaskError::Error(-1));
+            assert_eq!(err.task_name(), "t-10");
+            assert!(matches!(err, TaskError::Error(_, -1)));
 
             tokio::task::yield_now().await;
 
