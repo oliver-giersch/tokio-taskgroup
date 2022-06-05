@@ -1,6 +1,12 @@
 mod stream;
 
-use std::{borrow::Cow, error, fmt, future::Future};
+use std::{
+    borrow::Cow,
+    error, fmt,
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 use tokio::{
     sync::{mpsc, oneshot},
@@ -132,10 +138,15 @@ pub struct JoinGroupHandle<E> {
     _tx: mpsc::UnboundedSender<Event<E>>,
 }
 
-impl<E> JoinGroupHandle<E> {
-    /// Joins all remaining tasks in the [`TaskGroup`].
-    pub async fn join(self) -> Result<(), TaskError<E>> {
-        self.done_rx.await.expect("not possible while handle exists")
+impl<E> Future for JoinGroupHandle<E> {
+    type Output = Result<(), TaskError<E>>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let rx = Pin::new(&mut self.get_mut().done_rx);
+        match rx.poll(cx) {
+            Poll::Ready(res) => Poll::Ready(res.expect("not possible while handle exists")),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
@@ -255,7 +266,7 @@ mod tests {
             group.spawn("c", async { Ok(()) }).unwrap();
 
             let handle = group.close();
-            let res = handle.join().await;
+            let res = handle.await;
             assert!(res.is_ok())
         })
     }
